@@ -1,0 +1,7 @@
+# 当前 DeepSeek 示例的必需依赖
+# Python 3.10+
+langchain>=1.2,<2
+langchain-deepseek>=1,<2
+python-dotenv>=1,<2
+rich>=13,<15
+tavily-python>=0.5,<1

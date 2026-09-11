@@ -1,0 +1,57 @@
+import os
+from pathlib import Path
+
+from rich import print as rprint
+from dotenv import load_dotenv
+from tavily import TavilyClient
+from langchain_deepseek import ChatDeepSeek
+
+load_dotenv(Path(__file__).with_name(".env"), override=False)
+
+
+def required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"缺少环境变量 {name}，请复制 .env.example 为 .env 后填写。"
+        )
+    return value
+
+
+DEEPSEEK_API_KEY = required_env("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+llm = ChatDeepSeek(
+    model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+    api_key=required_env("DEEPSEEK_API_KEY"),
+    base_url=DEEPSEEK_BASE_URL,
+    temperature=float(os.getenv("DEEPSEEK_TEMPERATURE", "0")),
+    streaming=True,
+)
+
+search = TavilyClient(
+    api_key=required_env("TAVILY_API_KEY")
+)
+if __name__ == "__main__":
+    query = "今天 AI 圈最新新闻"
+    results = search.search(query=query, max_results=5)
+
+    context = "\n".join(
+        f"标题：{item['title']}\n内容：{item['content']}\n链接：{item['url']}"
+        for item in results["results"]
+    )
+
+    prompt = f"""
+请根据下面的实时搜索结果，用中文总结今天 AI 圈最新新闻。
+不要编造信息。
+
+搜索结果：
+{context}
+"""
+
+    print("AI: ", end="", flush=True)
+    for chunk in llm.stream(prompt):
+        rprint(chunk.content, end="", flush=True)
+    print()
+

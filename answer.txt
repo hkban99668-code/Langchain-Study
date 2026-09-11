@@ -1,0 +1,213 @@
+输入：
+/opt/homebrew/Caskroom/miniforge/base/envs/langchain1.2/bin/python main.py
+联网技术学习助手已启动，输入 quit 退出。
+用户水平（默认初学者）：5年从业者
+学习目标（默认学习 Agent 开发）：拓展新业务
+回答风格（默认中文、通俗、带代码）：带代码， 原理讲解
+
+技术问题：当发现调用agent tool出现错误时怎么排查代码
+
+输出：## 1. 简单解释
+
+Agent tool 调用出错，本质上是**一次"LLM 决策 → 工具执行 → 结果回灌"的链路中某一环断了**。排查的核心不是"看最后报错"，而是**把整条执行轨迹（trajectory）当成一等公民来审查**——因为根因往往出现在错误暴露前的 2~3 步。
+
+对 5 年从业者来说，关键转变是：**不要靠读日志猜，而是把轨迹归一化后写自动化断言**。
+
+---
+
+## 2. 核心概念
+
+排查 Agent tool 错误，需要区分**四类失败点**，每类的排查手段不同：
+
+| 失败层 | 典型症状 | 排查入口 |
+|---|---|---|
+| **LLM 决策层** | 选错工具、参数幻觉、死循环重试 | 看 agent 节点的输出消息 |
+| **工具执行层** | 抛异常、超时、返回非法 JSON | 看 tool 节点的入参/出参 |
+| **结果回灌层** | 工具成功但 LLM 误解结果 | 看 tool_result 消息如何拼回上下文 |
+| **状态/图控制层** | 递归超限、条件边走错 | 看 StateGraph 的 conditional_edges |
+
+**关键洞察**：Agent 调试打破了传统调试的三个假设——不可重现（同输入不同路径）、无法断点（推理循环内）、证据滞后（根因早于症状）。所以必须**结构化轨迹**。
+
+---
+
+## 3. 联网资料总结
+
+本次成功获取了 5 条资料，核心要点：
+
+**（1）LangGraph 官方推荐：用图结构显式处理工具错误**
+官方 how-to 给出的模式是：在 `tools` 节点后加一个 `should_fallback` 条件边，失败时走 `remove_failed_tool_call_attempt` → `fallback_agent`，而不是让 agent 无脑重试。这直接对应"结果回灌层"的排查——**把错误当成状态流转，而不是异常抛出**。
+
+**（2）Agent 死循环的 9 类根因**（来自 AI 编程社区）
+- Tool 返回模糊结果（如空输出）→ LLM 无法判断成功，反复验证
+- Tool 返回异常 → 动作-错误循环（连续 3 次相同动作 + 相同错误）
+- Tool 返回格式损坏（JSON 缺引号）→ 解析失败重试
+- MCP 超时/断连 → Agent 误判为"需重试"而非"需换方法"
+- Tool 选择错误（该用 Replace 却用 Write）
+- 上下文噪声累积 → 30 轮调用后上下文被污染
+
+**（3）系统化调试方法论**（TianPan.co）
+- **轨迹归一化**：把异构日志转成统一 schema，每步结构一致
+- **可执行约束**：从工具 schema 自动生成断言（参数类型、必填字段、返回格式）
+- **领域策略**：业务规则写成可测试条件（如"下单前必须查库存"）
+- 根因常在早期，症状在后期——必须做**步骤级归因**
+
+**（4）Reflexion / Self-Refine 思路**
+失败后不是简单重试，而是生成"反思"存入长期记忆，避免重复踩坑。
+
+**（5）实战验证模式**（Claude Agent SDK 修 C++ 构建错误）
+- 自动回滚：引入新错误就回滚
+- 增量验证：只编译受影响文件
+- 回归检测：确保没破坏其他部分
+
+---
+
+## 4. 代码示例（带原理讲解）
+
+### 4.1 最小可复现的排查骨架
+
+```python
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode
+
+# 原理：把"工具失败"建模为图上的一个状态分支，
+# 而不是让异常冒泡到顶层——这样每一步都可观测、可断言。
+workflow = StateGraph(MessagesState)
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", ToolNode(tools))
+workflow.add_node("remove_failed_tool_call_attempt", remove_failed_tool_call_attempt)
+workflow.add_node("fallback_agent", call_fallback_model)
+
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges("agent", should_continue, ["tools", END])
+# 关键：tools 之后不是直接回 agent，而是先判断是否失败
+workflow.add_conditional_edges("tools", should_fallback)
+workflow.add_edge("remove_failed_tool_call_attempt", "fallback_agent")
+workflow.add_edge("fallback_agent", "tools")
+
+app = workflow.compile()
+```
+
+**原理**：`should_fallback` 是一个纯函数，检查最后一条 ToolMessage 是否含错误标记。这样"失败"变成图上的显式边，而不是隐式异常——**可观测性从"读日志"升级为"读图状态"**。
+
+### 4.2 轨迹归一化 + 自动断言（排查的核心武器）
+
+```python
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class Step:
+    """归一化后的单步轨迹——所有来源的日志都转成这个 schema"""
+    idx: int
+    kind: str          # "llm" | "tool_call" | "tool_result"
+    name: str | None   # 工具名
+    args: dict | None  # 工具入参
+    output: Any        # 工具返回
+    error: str | None  # 错误信息
+
+def normalize(messages) -> list[Step]:
+    """把 LangGraph 的 messages 转成统一 Step 列表"""
+    steps = []
+    for i, m in enumerate(messages):
+        if m.type == "ai" and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                steps.append(Step(i, "tool_call", tc["name"], tc["args"], None, None))
+        elif m.type == "tool":
+            steps.append(Step(i, "tool_result", m.name, None, m.content,
+                              m.content if "error" in str(m.content).lower() else None))
+    return steps
+
+def check_constraints(steps: list[Step], tool_schemas: dict):
+    """可执行约束：从工具 schema 自动生成断言"""
+    violations = []
+    for s in steps:
+        if s.kind != "tool_call":
+            continue
+        schema = tool_schemas.get(s.name)
+        if not schema:
+            violations.append(f"[{s.idx}] 未知工具: {s.name}")
+            continue
+        # 必填字段检查
+        for req in schema.get("required", []):
+            if req not in (s.args or {}):
+                violations.append(f"[{s.idx}] {s.name} 缺少必填参数: {req}")
+        # 类型检查
+        for k, v in (s.args or {}).items():
+            expected = schema["properties"].get(k, {}).get("type")
+            if expected == "string" and not isinstance(v, str):
+                violations.append(f"[{s.idx}] {s.name}.{k} 类型错误: 期望 str 得到 {type(v)}")
+    return violations
+
+def detect_loop(steps: list[Step], window: int = 3):
+    """检测动作-错误循环：连续 N 次相同动作 + 相同错误"""
+    calls = [s for s in steps if s.kind == "tool_call"]
+    for i in range(len(calls) - window + 1):
+        chunk = calls[i:i+window]
+        sigs = {(c.name, str(c.args)) for c in chunk}
+        if len(sigs) == 1:
+            return f"检测到死循环: {chunk[0].name} 连续 {window} 次相同调用"
+    return None
+```
+
+**原理**：
+- `normalize` 解决"异构日志"问题——不管原始格式如何，统一成 `Step`
+- `check_constraints` 把工具 schema 变成**免费获得的断言**（参数类型、必填字段）
+- `detect_loop` 对应资料中提到的 `StuckDetector` 模式——**连续 3 次相同动作 + 相同错误 = 卡死**
+
+### 4.3 排查入口：打印带索引的轨迹
+
+```python
+response = app.invoke(
+    {"messages": [("human", "帮我查一下订单 12345 的物流")]},
+    {"recursion_limit": 10},  # 关键：限制递归，防止无限循环
+)
+
+steps = normalize(response["messages"])
+for s in steps:
+    print(f"[{s.idx}] {s.kind:12} {s.name or '':20} args={s.args} err={s.error}")
+
+# 自动断言
+violations = check_constraints(steps, tool_schemas)
+loop = detect_loop(steps)
+if violations: print("约束违规:", violations)
+if loop: print("循环告警:", loop)
+```
+
+**原理**：`recursion_limit` 是 LangGraph 的硬性熔断——即使逻辑有 bug，也不会无限烧 token。这是排查前的**第一道保险**。
+
+---
+
+## 5. 常见错误（排查时容易踩的坑）
+
+1. **只看最后一条报错**——根因常在 2~3 步之前。必须做步骤级归因。
+2. **把工具异常直接抛给 LLM**——LLM 会理解为"重试"，导致死循环。应显式走 fallback 分支。
+3. **工具返回模糊结果**（空输出、`{"status": "ok"}` 无细节）——LLM 无法判断成功，反复验证。**工具返回值要明确表达"成功/失败/无数据"**。
+4. **上下文噪声累积**——30 轮调用后，300 行日志淹没关键错误。应做 Observation 截断/摘要。
+5. **没有 `recursion_limit`**——死循环直接烧穿预算。
+6. **工具 schema 与实际返回不一致**——LLM 按 schema 解析，实际返回格式损坏（如 JSON 缺引号）→ 解析失败重试。
+7. **MCP/远程工具超时被当成"需重试"**——应区分"可重试错误"和"需换方法错误"。
+
+---
+
+## 6. 下一步练习
+
+1. **给现有 Agent 加轨迹归一化**：把 `messages` 转成 `Step` 列表，打印带索引的完整轨迹。
+2. **写 3 条可执行约束**：从你常用工具的 schema 自动生成参数断言。
+3. **实现 `detect_loop`**：连续 3 次相同工具 + 相同参数就告警。
+4. **加 fallback 分支**：参考 LangGraph 官方模式，工具失败时走 `remove_failed_tool_call_attempt` → `fallback_agent`。
+5. **引入 Reflexion**：失败后让 LLM 生成一段"反思"存入状态，下次调用时注入 prompt。
+6. **压测上下文**：构造一个需要 20+ 轮工具调用的任务，观察上下文膨胀对决策质量的影响。
+
+---
+
+## 7. 参考来源
+
+1. [如何处理工具调用错误 - LangGraph 官方文档](https://www.aidoczh.com/langgraph/how-tos/tool-calling-errors)
+2. [如何处理工具调用错误 - LangChain 教程](https://github.langchain.ac.cn/langgraph/how-tos/tool-calling-errors)
+3. [Agent为什么会死循环？ - AI编程社区](https://aicoding.csdn.net/6a48ce6b10ee7a33f287e662.html)
+4. [AI Agent 系统化调试：从凭空猜测到根因分析 - TianPan.co](https://tianpan.co/zh/blog/2026/02/19/systematic-debugging-ai-agents-production)
+5. [实战：用 Claude Agent SDK 构建多 Agent 系统自动修复 C++ 构建错误 - 博客园](https://www.cnblogs.com/itech/p/19823071)
+
+> 注：以上资料均来自本次联网检索，链接保留原始出处。Reflexion（Shinn et al., NeurIPS 2023）和 Self-Refine（Madaan et al., 2023）为资料中提及的论文，未单独检索原文。
+
+技术问题：
